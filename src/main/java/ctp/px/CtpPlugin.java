@@ -5,7 +5,6 @@ import ctp.px.listeners.CombatListener;
 import ctp.px.listeners.PlayerListener;
 import ctp.px.managers.CombatManager;
 import ctp.px.managers.TpaManager;
-import ctp.px.managers.TpaManager.RequestType;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import io.papermc.paper.command.brigadier.Commands;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
