@@ -9,8 +9,10 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
+import org.checkerframework.checker.units.qual.s;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -21,19 +23,34 @@ public final class TpaManager {
     private static final double MOVEMENT_THRESHOLD_SQUARED = 0.01;
 
     private final JavaPlugin plugin;
-    private final Map<UUID, Request> requestsByRecipient = new HashMap<>();
+    private final Map<UUID, Map<UUID, Request>> requestsByRecipient = new HashMap<>();
     private final Map<UUID, Request> requestsBySender = new HashMap<>();
     private final Map<UUID, Warmup> warmups = new HashMap<>();
     private final Map<UUID, Cooldown> cooldowns = new HashMap<>();
 
+    private CombatManager combatManager;
+
     public TpaManager(JavaPlugin plugin) {
         this.plugin = plugin;
+    }
+
+    public void setCombatManager(CombatManager combatManager) {
+        this.combatManager = combatManager;
+    }
+
+    private boolean inCombat(Player player) {
+        return combatManager != null && combatManager.isInCombat(player);
     }
 
     public void request(Player sender, String targetName, RequestType type) {
         String permission = type == RequestType.TPA ? "tpa.use" : "tpa.tpahere";
         if (!sender.hasPermission(permission)) {
             sender.sendMessage(message("&cYou don't have permission to use this command."));
+            return;
+        }
+
+        if (inCombat(sender)) {
+            sender.sendMessage(message("&cYou cannot send teleport requests while in combat."));
             return;
         }
 
@@ -53,38 +70,37 @@ public final class TpaManager {
             return;
         }
 
-        if (requestsByRecipient.containsKey(recipient.getUniqueId())) {
-            sender.sendMessage(message("&cThat player already has a pending request."));
-            return;
-        }
-
         if (requestsBySender.containsKey(sender.getUniqueId())) {
             sender.sendMessage(message("&cYou already have a pending request."));
             return;
         }
 
         Request request = new Request(sender.getUniqueId(), recipient.getUniqueId(), type);
-        requestsByRecipient.put(recipient.getUniqueId(), request);
+        requestsByRecipient.computeIfAbsent(recipient.getUniqueId(), ignored -> new LinkedHashMap<>())
+                .put(sender.getUniqueId(), request);
         requestsBySender.put(sender.getUniqueId(), request);
-        request.expirationTask = Bukkit.getScheduler().runTaskLater(plugin, () -> expireRequest(request), REQUEST_DURATION_TICKS);
+        request.expirationTask = Bukkit.getScheduler().runTaskLater(plugin, () -> expireRequest(request),
+                REQUEST_DURATION_TICKS);
 
         if (type == RequestType.TPA) {
             recipient.sendMessage(message("&e" + sender.getName() + " wants to teleport to you."));
         } else {
             recipient.sendMessage(message("&e" + sender.getName() + " wants you to teleport to them."));
         }
-        recipient.sendMessage(message("&eUse /" + type.command + " accept or /" + type.command + " deny."));
+        recipient.sendMessage(message("&eUse /" + type.responseCommand + " " + sender.getName()
+                + " accept or /" + type.responseCommand + " " + sender.getName() + " deny."));
         sender.sendMessage(message("&aTeleport request sent to " + recipient.getName() + "."));
     }
 
-    public void accept(Player recipient, RequestType commandType) {
-        Request request = requestsByRecipient.get(recipient.getUniqueId());
+    public void accept(Player recipient, String requesterName, RequestType commandType) {
+        Request request = findRequest(recipient, requesterName);
         if (request == null) {
-            recipient.sendMessage(message("&cYou don't have a pending teleport request."));
+            recipient.sendMessage(message("&cYou don't have a pending request from that player."));
             return;
         }
         if (request.type != commandType) {
-            recipient.sendMessage(message("&cThis is a " + request.type.displayName + ". Use /" + request.type.command + " accept."));
+            recipient.sendMessage(message("&cThis is a " + request.type.displayName + ". Use /"
+                    + request.type.responseCommand + " " + requesterName + " accept."));
             return;
         }
         if (!recipient.hasPermission(permissionFor(commandType))) {
@@ -99,8 +115,17 @@ public final class TpaManager {
             return;
         }
 
+        if (inCombat(recipient)) {
+            recipient.sendMessage(message("&cYou cannot accept teleport requests while in combat."));
+            return;
+        }
+
         Player teleporter = request.type == RequestType.TPA ? sender : recipient;
         Player destination = request.type == RequestType.TPA ? recipient : sender;
+        if (inCombat(teleporter)) {
+            recipient.sendMessage(message("&cThat player is in combat and cannot teleport right now."));
+            return;
+        }
         if (warmups.containsKey(teleporter.getUniqueId())) {
             recipient.sendMessage(message("&cThat player already has a teleport in progress."));
             return;
@@ -117,14 +142,15 @@ public final class TpaManager {
         startWarmup(teleporter, destination);
     }
 
-    public void deny(Player recipient, RequestType commandType) {
-        Request request = requestsByRecipient.get(recipient.getUniqueId());
+    public void deny(Player recipient, String requesterName, RequestType commandType) {
+        Request request = findRequest(recipient, requesterName);
         if (request == null) {
-            recipient.sendMessage(message("&cYou don't have a pending teleport request."));
+            recipient.sendMessage(message("&cYou don't have a pending request from that player."));
             return;
         }
         if (request.type != commandType) {
-            recipient.sendMessage(message("&cThis is a " + request.type.displayName + ". Use /" + request.type.command + " deny."));
+            recipient.sendMessage(message("&cThis is a " + request.type.displayName + ". Use /"
+                    + request.type.responseCommand + " " + requesterName + " deny."));
             return;
         }
         if (!recipient.hasPermission(permissionFor(commandType))) {
@@ -137,6 +163,24 @@ public final class TpaManager {
         Player sender = Bukkit.getPlayer(request.senderId);
         if (sender != null) {
             sender.sendMessage(message("&c" + recipient.getName() + " denied your teleport request."));
+        }
+    }
+
+    public void cancel(Player sender) {
+        Request senderRequest = requestsBySender.get(sender.getUniqueId());
+        if (senderRequest == null) {
+            sender.sendMessage(message("&cYou don't have a pending request."));
+            return;
+        }
+        if (!sender.hasPermission(permissionFor(senderRequest.type))) {
+            sender.sendMessage(message("&cYou don't have permission to use this command."));
+            return;
+        }
+        removeRequest(senderRequest);
+        sender.sendMessage(message("&eTeleport Request Cancelled."));
+        Player recipient = Bukkit.getPlayer(senderRequest.recipientId);
+        if (recipient != null) {
+            recipient.sendMessage(message("&c" + sender.getName() + " cancelled the teleport request."));
         }
     }
 
@@ -164,18 +208,22 @@ public final class TpaManager {
             return;
         }
         removeWarmup(warmup);
-        String cancellationMessage = reason == CancelReason.MOVED
-                ? "&cTeleport cancelled because you moved."
-                : "&cTeleport cancelled because you took damage.";
+        String cancellationMessage = switch (reason) {
+            case MOVED -> "&cTeleport cancelled because you moved.";
+            case DAMAGED -> "&cTeleport cancelled because you took damage.";
+            case COMBAT -> "&cTeleport cancelled because you entered combat.";
+        };
         player.sendMessage(message(cancellationMessage));
         player.sendActionBar(message("&cTeleport cancelled."));
     }
 
     public void handleQuit(Player player) {
         UUID playerId = player.getUniqueId();
-        Request incoming = requestsByRecipient.get(playerId);
+        Map<UUID, Request> incoming = requestsByRecipient.get(playerId);
         if (incoming != null) {
-            removeRequest(incoming);
+            for (Request request : incoming.values().toArray(Request[]::new)) {
+                removeRequest(request);
+            }
         }
         Request outgoing = requestsBySender.get(playerId);
         if (outgoing != null) {
@@ -202,7 +250,7 @@ public final class TpaManager {
     }
 
     public void clear() {
-        for (Request request : requestsByRecipient.values().toArray(Request[]::new)) {
+        for (Request request : requestsBySender.values().toArray(Request[]::new)) {
             removeRequest(request);
         }
         for (Warmup warmup : warmups.values().toArray(Warmup[]::new)) {
@@ -227,7 +275,8 @@ public final class TpaManager {
     }
 
     private void expireRequest(Request request) {
-        if (requestsByRecipient.get(request.recipientId) != request) {
+        Map<UUID, Request> recipientRequests = requestsByRecipient.get(request.recipientId);
+        if (recipientRequests == null || recipientRequests.get(request.senderId) != request) {
             return;
         }
         removeRequest(request);
@@ -242,11 +291,31 @@ public final class TpaManager {
     }
 
     private void removeRequest(Request request) {
-        requestsByRecipient.remove(request.recipientId, request);
+        Map<UUID, Request> recipientRequests = requestsByRecipient.get(request.recipientId);
+        if (recipientRequests != null) {
+            recipientRequests.remove(request.senderId, request);
+            if (recipientRequests.isEmpty()) {
+                requestsByRecipient.remove(request.recipientId, recipientRequests);
+            }
+        }
         requestsBySender.remove(request.senderId, request);
         if (request.expirationTask != null) {
             request.expirationTask.cancel();
         }
+    }
+
+    private Request findRequest(Player recipient, String requesterName) {
+        Map<UUID, Request> recipientRequests = requestsByRecipient.get(recipient.getUniqueId());
+        if (recipientRequests == null) {
+            return null;
+        }
+        for (Request request : recipientRequests.values()) {
+            Player sender = Bukkit.getPlayer(request.senderId);
+            if (sender != null && sender.getName().equalsIgnoreCase(requesterName)) {
+                return request;
+            }
+        }
+        return null;
     }
 
     private void startWarmup(Player teleporter, Player destination) {
@@ -342,20 +411,21 @@ public final class TpaManager {
 
     public enum RequestType {
         TPA("tpa", "normal TPA"),
-        TPA_HERE("tpahere", "TPA Here");
+        TPA_HERE("tpa here", "TPA Here");
 
-        private final String command;
+        private final String responseCommand;
         private final String displayName;
 
-        RequestType(String command, String displayName) {
-            this.command = command;
+        RequestType(String responseCommand, String displayName) {
+            this.responseCommand = responseCommand;
             this.displayName = displayName;
         }
     }
 
     public enum CancelReason {
         MOVED,
-        DAMAGED
+        DAMAGED,
+        COMBAT
     }
 
     private static final class Request {
